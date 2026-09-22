@@ -45,16 +45,40 @@ function parseScripts(html){
   const re=/<script[^>]*?(?:id=["']([^"']+)["'])?[^>]*>([\s\S]*?)<\/script>/gi;
   let m;
   while((m=re.exec(html))){
-    const id=(m[1]||'').toLowerCase(), txt=m[2].trim();
-    if(!txt || (!id.includes('sigi') && !id.includes('universal') && !id.includes('rehydration') && !txt.includes('ItemModule') && !txt.includes('itemStruct'))) continue;
-    try { roots.push(JSON.parse(txt)); } catch(_){}
+    const txt=m[2].trim(); if(!txt) continue;
+    try { roots.push(JSON.parse(txt)); } catch(_){
+      try {
+        const decoded=txt.replace(/\\u([0-9a-fA-F]{4})/g,(_,h)=>String.fromCharCode(parseInt(h,16))).replace(/\\"/g,'"');
+        if(decoded!==txt && /^\s*[\[{]/.test(decoded)) roots.push(JSON.parse(decoded));
+      } catch(__){}
+    }
   }
   return roots;
+}
+function rawNumberCandidates(html, keys){
+  const t=String(html||''), out=[];
+  for(const key of keys){
+    const re=new RegExp('["\\\\]'+key+'["\\\\]\\s*[:=]\\s*["\\\\]?(\\d{1,4})','gi');
+    let m; while((m=re.exec(t))) { const n=Number(m[1]); if(Number.isFinite(n)&&n>0&&n<=240) out.push(n); }
+  }
+  return out;
+}
+function modeNumber(values){
+  if(!values.length)return 0; const c=new Map(); for(const n of values)c.set(n,(c.get(n)||0)+1);
+  return [...c.entries()].sort((a,b)=>b[1]-a[1]||a[0]-b[0])[0][0];
+}
+function rawRegionCandidate(html){
+  const t=String(html||'');
+  for(const key of ['region_code','regionCode','authorRegion','author_region','countryCode','country_code','registeredCountry','registered_country','creatorRegion','creator_region']){
+    const re=new RegExp('["\\\\]'+key+'["\\\\]\\s*[:=]\\s*["\\\\]([^"\\\\]{1,80})','i');
+    const m=t.match(re); if(m){const r=normalizePublicRegion(m[1]); if(r)return r;}
+  }
+  return '';
 }
 function collectVariants(video){
   const out=[],seen=new Set();
   const keys=[
-    'bitrateInfo','bit_rate_info','bitrate_info','bitRateInfo',
+    'bitrateInfo','bit_rate','bitRate','bit_rate_info','bitrate_info','bitRateInfo',
     'playAddr','play_addr','downloadAddr','download_addr',
     'playAddrH264','play_addr_h264','downloadAddrH264','download_addr_h264',
     'playAddrBytevc1','play_addr_bytevc1','downloadAddrBytevc1','download_addr_bytevc1',
@@ -499,6 +523,40 @@ function findFirstFieldByRegex(html, keys){
   return '';
 }
 
+async function fetchUnsignedItemDetail(id, pageHtml){
+  if(!id) return null;
+  // TikTok's web item-detail endpoint is known to return the same aweme_detail
+  // structure used by web extractors, including video.bit_rate[]. It may reject
+  // unsigned requests; this is only a best-effort enrichment and never affects
+  // the public-page fallback.
+  let msToken='';
+  const mt=String(pageHtml||'').match(/(?:msToken|ms_token)\s*[=:]\s*["']([^"']{20,})["']/i);
+  if(mt) msToken=mt[1];
+  const params=new URLSearchParams({
+    aid:'1988',app_language:'en',app_name:'tiktok_web',browser_language:'en-US',
+    browser_name:'Mozilla',browser_online:'true',browser_platform:'Win32',
+    channel:'tiktok_web',cookie_enabled:'true',device_platform:'web_pc',
+    focus_state:'true',from_page:'video',history_len:'1',is_fullscreen:'false',
+    is_page_visible:'true',itemId:String(id),language:'en',os:'windows',
+    priority_region:'US',referer:'',region:'US',screen_height:'1080',
+    screen_width:'1920',webcast_language:'en',tz_name:'UTC'
+  });
+  if(msToken) params.set('msToken',msToken);
+  try{
+    const r=await fetch('https://www.tiktok.com/api/item/detail/?'+params.toString(),{
+      redirect:'follow',headers:{
+        'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36',
+        'Accept':'application/json,text/plain,*/*','Accept-Language':'en-US,en;q=0.9',
+        'Referer':'https://www.tiktok.com/'
+      }
+    });
+    if(!r.ok) return null;
+    const text=await r.text();
+    if(!text||!text.trim())return null;
+    try{return JSON.parse(text)}catch(_){return null}
+  }catch(_){return null}
+}
+
 async function analyze(url){
   const u=cleanUrl(url);
   const oeUrl='https://www.tiktok.com/oembed?url='+encodeURIComponent(u);
@@ -510,6 +568,33 @@ async function analyze(url){
     throw new Error(`TikTok page returned HTTP ${page.r.status}`);
   }
   const d=extract(page.text,u,oembed);
+  // API-style enrichment: current TikTok extractors obtain per-stream FPS
+  // from video.bit_rate[]. The normal web page exposes bitrateInfo instead,
+  // so try the public web item-detail response as an additional source.
+  try{
+    const apiDetail=await fetchUnsignedItemDetail(d.id||((u.match(/\/video\/(\d+)/i)||[])[1]||''),page.text);
+    const apiVideo=apiDetail?.itemInfo?.itemStruct?.video || apiDetail?.itemStruct?.video || apiDetail?.video;
+    if(apiVideo){
+      const apiVariants=collectVariants(apiVideo);
+      if(apiVariants.length){
+        d.variants=[...(d.variants||[]),...apiVariants];
+        const seen=new Set();
+        d.variants=d.variants.filter(v=>{const k=String(v.url||'')+'|'+String(v.name||'')+'|'+String(v.fps||0);if(seen.has(k))return false;seen.add(k);return true;});
+      }
+      if(!d.fps){
+        const apiFps=modeNumber(apiVariants.map(v=>Number(v.fps||0)).filter(n=>n>0));
+        if(apiFps)d.fps=apiFps;
+      }
+    }
+  }catch(_){}
+  // Raw bootstrap fallback: catches escaped/non-standard TikTok JSON containers.
+  const rawFps=rawNumberCandidates(page.text,['FPS','Fps','fps','FrameRate','frameRate','frame_rate']);
+  const rawFpsMode=modeNumber(rawFps);
+  if(!d.fps && rawFpsMode) d.fps=rawFpsMode;
+  if(Array.isArray(d.variants) && rawFpsMode){
+    for(const v of d.variants){ if(!v.fps) v.fps=rawFpsMode; v.displayQuality=variantQuality(v,rawFpsMode); }
+  }
+  if(!d.region){ const rr=rawRegionCandidate(page.text); if(rr) d.region=rr; }
   d.visibility=detectPrivatePage(page.text,oembed, d.id?{id:d.id}:null, page.r.status)?'Private':'Public';
   if(d.visibility==='Private' && !d.id){
     return {ok:true,private:true,visibility:'Private',id:'',stats:d.stats||{},region:'',shadowban:'Inconclusive',publicPageStatus:page.r.status};
@@ -572,6 +657,22 @@ async function analyze(url){
   // Additional public user-profile fallback inspired by current/open TikTok
   // web API wrappers: query the public user detail endpoint using the creator
   // username. Only an explicitly returned region field is accepted.
+  if(!d.region && d.username){
+    // The video page may omit account region even when the public creator page
+    // exposes it. Fetch the public profile page and inspect its embedded JSON.
+    try{
+      const profileUrl='https://www.tiktok.com/@'+encodeURIComponent(String(d.username).replace(/^@/,''));
+      const pr=await fetchText(profileUrl,{
+        'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36',
+        'Accept-Language':'en-US,en;q=0.9',
+        'Referer':u
+      });
+      if(pr.r.ok){
+        const rr=extractPublicRegionFromPage(pr.text);
+        if(rr.value){d.region=rr.value;d.regionSource='TikTok public creator profile embedded metadata';}
+      }
+    }catch(_){}
+  }
   if(!d.region && d.username){
     const publicUserRegion=await publicTikTokUserRegion(d.username);
     if(publicUserRegion){
