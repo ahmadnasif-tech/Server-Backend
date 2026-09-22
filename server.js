@@ -2,7 +2,7 @@ const http = require('http');
 const { URL } = require('url');
 
 const PORT = Number(process.env.PORT || 8787);
-const HOST = process.env.HOST || '127.0.0.1';
+const HOST = process.env.HOST || '0.0.0.0';
 
 function send(res, status, data, type='application/json'){
   res.writeHead(status, {
