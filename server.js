@@ -87,7 +87,7 @@ function collectVariants(video){
     const height=num(o.Height,o.height,p.Height,p.height,o.VideoHeight,o.video_height,p.VideoHeight,p.video_height);
     const bitrate=num(o.Bitrate,o.bit_rate,o.bitRate,o.bitrate,p.Bitrate,p.bit_rate,p.bitRate,p.bitrate);
     const size=num(o.DataSize,o.data_size,o.dataSize,p.DataSize,p.data_size,p.DataSize,p.size);
-    const fps=num(o.Fps,o.fps,o.FrameRate,o.frameRate,o.frame_rate,p.Fps,p.fps,p.FrameRate,p.frameRate,p.frame_rate);
+    const fps=num(o.FPS,o.Fps,o.fps,o.FrameRate,o.frameRate,o.frame_rate,p.FPS,p.Fps,p.fps,p.FrameRate,p.frameRate,p.frame_rate);
     const name=String(q||keyHint||'video stream');
     const id=url+'|'+name+'|'+width+'x'+height+'|'+codec;
     if(seen.has(id))return;
@@ -444,8 +444,10 @@ async function publicTikTokUserRegion(username){
   const endpoints=[
     'https://www.tiktok.com/api/user/detail/?uniqueId='+encodeURIComponent(clean),
     'https://www.tiktok.com/api/user/detail/?unique_id='+encodeURIComponent(clean),
-    'https://m.tiktok.com/api/user/detail/?uniqueId='+encodeURIComponent(clean)
+    'https://m.tiktok.com/api/user/detail/?uniqueId='+encodeURIComponent(clean),
+    'https://www.tiktok.com/api/user/detail/?unique_id='+encodeURIComponent(clean)
   ];
+  const regionKeys=['region','regionCode','region_code','countryCode','country_code','registeredCountry','registered_country'];
   for(const endpoint of endpoints){
     try{
       const r=await fetch(endpoint,{
@@ -459,14 +461,29 @@ async function publicTikTokUserRegion(username){
       });
       if(!r.ok)continue;
       const j=await r.json();
-      const candidates=[
+      const direct=[
         j?.userInfo?.user?.region,j?.user?.region,j?.data?.userInfo?.user?.region,
         j?.userInfo?.user?.regionCode,j?.userInfo?.user?.region_code,
-        j?.user?.regionCode,j?.user?.region_code
+        j?.user?.regionCode,j?.user?.region_code,
+        j?.userInfo?.user?.countryCode,j?.userInfo?.user?.country_code
       ];
-      for(const value of candidates){
+      for(const value of direct){
         const region=normalizePublicRegion(value);
         if(region)return {value:region,source:'TikTok public user detail endpoint'};
+      }
+      // Some public responses wrap the profile several levels deeper. Accept
+      // only explicit region/country-code fields on an object that also looks
+      // like a user/profile record; never use generic geo/location fields.
+      for(const o of deepObjects(j)){
+        if(!o||typeof o!=='object')continue;
+        const userish=!!(o.uniqueId||o.unique_id||o.nickname||o.secUid||o.sec_uid||o.user||o.userInfo||o.profile);
+        if(!userish)continue;
+        for(const k of regionKeys){
+          if(Object.prototype.hasOwnProperty.call(o,k)){
+            const region=normalizePublicRegion(o[k]);
+            if(region)return {value:region,source:'TikTok public user detail endpoint'};
+          }
+        }
       }
     }catch(_){}
   }
