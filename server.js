@@ -172,6 +172,7 @@ function extract(html, requestedUrl, oembed){
     ok:true,
     id:first(item?.id,item?.aweme_id,id),
     author:first(author?.uniqueId,author?.unique_id,author?.nickname,oembed?.author_name),
+    username:first(author?.uniqueId,author?.unique_id,''),
     nickname:first(author?.nickname,oembed?.author_name),
     caption:first(item?.desc,item?.description,oembed?.title,''),
     createTime:num(first(item?.createTime,item?.create_time)),
@@ -407,8 +408,11 @@ function normalizePublicRegion(value){
 }
 function extractPublicRegion(root){
   if(!root)return '';
+  // Only creator/account-region fields are accepted here. Generic `country`
+  // fields are intentionally excluded because they can describe unrelated
+  // metadata and would create false Region results.
   const keys=['region_code','regionCode','authorRegion','author_region','countryCode','country_code',
-    'country','countryRegion','country_region','registeredCountry','registered_country','creatorRegion','creator_region'];
+    'registeredCountry','registered_country','creatorRegion','creator_region'];
   for(const o of deepObjects(root)){
     if(!o||typeof o!=='object')continue;
     const authorish=!!(o.author||o.authorInfo||o.uniqueId||o.unique_id||o.nickname||o.creator);
@@ -551,8 +555,8 @@ async function analyze(url){
   // Additional public user-profile fallback inspired by current/open TikTok
   // web API wrappers: query the public user detail endpoint using the creator
   // username. Only an explicitly returned region field is accepted.
-  if(!d.region && d.author){
-    const publicUserRegion=await publicTikTokUserRegion(d.author);
+  if(!d.region && d.username){
+    const publicUserRegion=await publicTikTokUserRegion(d.username);
     if(publicUserRegion){
       d.region=publicUserRegion.value;
       d.regionSource=publicUserRegion.source;
