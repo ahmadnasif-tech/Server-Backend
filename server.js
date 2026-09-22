@@ -51,30 +51,80 @@ function parseScripts(html){
   }
   return roots;
 }
-function pickVariant(video){
-  const lists=[];
-  for(const k of ['bitrateInfo','bit_rate_info','bitrate_info','bitRateInfo']){
-    if(Array.isArray(video?.[k])) lists.push(...video[k]);
-  }
-  if(!lists.length && video) {
-    for(const o of deepObjects(video)) {
-      if(Array.isArray(o?.bitrateInfo)) lists.push(...o.bitrateInfo);
-      if(Array.isArray(o?.bit_rate_info)) lists.push(...o.bit_rate_info);
+function collectVariants(video){
+  const out=[],seen=new Set();
+  const keys=[
+    'bitrateInfo','bit_rate_info','bitrate_info','bitRateInfo',
+    'playAddr','play_addr','downloadAddr','download_addr',
+    'playAddrH264','play_addr_h264','downloadAddrH264','download_addr_h264',
+    'playAddrBytevc1','play_addr_bytevc1','downloadAddrBytevc1','download_addr_bytevc1',
+    'playAddrBytevc2','play_addr_bytevc2','downloadAddrBytevc2','download_addr_bytevc2',
+    'playAddrH265','play_addr_h265','downloadAddrH265','download_addr_h265',
+    'playAddrH264HD','play_addr_h264_hd','downloadAddrH264HD','download_addr_h264_hd',
+    'playAddrH265HD','play_addr_h265_hd','downloadAddrH265HD','download_addr_h265_hd'
+  ];
+  const num=(...xs)=>{for(const x of xs){const n=Number(x);if(Number.isFinite(n)&&n>0)return n}return 0};
+  const mediaUrl=x=>{
+    if(typeof x==='string')return x;
+    if(!x||typeof x!=='object')return '';
+    for(const k of ['UrlList','urlList','url_list','url','uri','Url','download_url','downloadUrl']){
+      const a=x[k];
+      if(Array.isArray(a)){const u=a.find(v=>typeof v==='string'&&/^https?:/i.test(v));if(u)return String(u)}
+      if(typeof a==='string'&&/^https?:/i.test(a))return a;
     }
-  }
-  const v=lists.find(x=>x && (x.PlayAddr||x.playAddr||x.play_addr)) || lists[0];
-  if(!v) return null;
-  const p=v.PlayAddr||v.playAddr||v.play_addr||{};
-  const urls=p.UrlList||p.url_list||p.urlList||v.UrlList||v.url_list||v.urlList||[];
-  return {
-    quality:first(v.GearName,v.gear_name,v.qualityType,v.quality_type,p.QualityType,p.quality_type,v.urlKey,v.url_key),
-    codec:first(v.CodecType,v.codecType,v.codec_type,p.CodecType,p.codec_type),
-    bitrate:first(v.Bitrate,v.bit_rate,v.bitRate,p.Bitrate,p.bit_rate,p.bitRate),
-    size:first(v.DataSize,v.data_size,v.dataSize,p.DataSize,p.data_size,p.dataSize),
-    width:first(v.Width,v.width,p.Width,p.width),
-    height:first(v.Height,v.height,p.Height,p.height),
-    url:urls[0] || p.Url || p.url || v.Url || v.url || ''
+    return '';
   };
+  const add=(x,keyHint)=>{
+    if(!x)return;
+    const o=typeof x==='object'?x:{value:x};
+    const p=o.PlayAddr||o.playAddr||o.play_addr||o.DownloadAddr||o.downloadAddr||o.download_addr||{};
+    const url=mediaUrl(x)||mediaUrl(p);
+    if(!url||!/^https?:/i.test(url))return;
+    const q=o.GearName||o.gearName||o.gear_name||o.QualityType||o.qualityType||o.quality_type||
+      p.GearName||p.gearName||p.gear_name||p.QualityType||p.qualityType||keyHint||'';
+    const codec=o.CodecType||o.codecType||o.codec_type||o.codec||p.CodecType||p.codecType||p.codec_type||'';
+    const width=num(o.Width,o.width,p.Width,p.width,o.VideoWidth,o.video_width,p.VideoWidth,p.video_width);
+    const height=num(o.Height,o.height,p.Height,p.height,o.VideoHeight,o.video_height,p.VideoHeight,p.video_height);
+    const bitrate=num(o.Bitrate,o.bit_rate,o.bitRate,o.bitrate,p.Bitrate,p.bit_rate,p.bitRate,p.bitrate);
+    const size=num(o.DataSize,o.data_size,o.dataSize,p.DataSize,p.data_size,p.DataSize,p.size);
+    const fps=num(o.Fps,o.fps,o.FrameRate,o.frameRate,o.frame_rate,p.Fps,p.fps,p.FrameRate,p.frameRate,p.frame_rate);
+    const name=String(q||keyHint||'video stream');
+    const id=url+'|'+name+'|'+width+'x'+height+'|'+codec;
+    if(seen.has(id))return;
+    seen.add(id);
+    out.push({name,quality:String(q||''),codec:String(codec||''),bitrate,size,width,height,fps,url,sourceKey:String(keyHint||'')});
+  };
+  const walk=(x,d=0)=>{
+    if(!x||typeof x!=='object'||d>18)return;
+    if(Array.isArray(x)){x.forEach(v=>walk(v,d+1));return}
+    for(const [k,v] of Object.entries(x)){
+      if(keys.includes(k)){
+        if(Array.isArray(v))v.forEach(x=>add(x,k));else add(v,k);
+      }
+      if(v&&typeof v==='object')walk(v,d+1);
+    }
+  };
+  walk(video);
+  return out;
+}
+function variantQuality(v, fallbackFps=0){
+  if(!v) return '';
+  const q=String(v.quality||v.name||'');
+  const m=q.match(/(?:^|_)(\d{3,4})(?:_|p|$)/i);
+  const w=num(v.width), h=num(v.height);
+  const base=num(m?.[1]) || (w&&h ? Math.min(w,h) : 0) || (w||h);
+  if(!base) return q;
+  const f=num(v.fps)||num(fallbackFps);
+  return f>0 ? `${base}p${Math.round(f)}` : `${base}p`;
+}
+function pickVariant(video){
+  const variants=collectVariants(video);
+  if(!variants.length) return null;
+  // Prefer the highest-resolution stream; bitrate is only a tie-breaker.
+  return variants.slice().sort((a,b)=>{
+    const ar=(a.width||0)*(a.height||0), br=(b.width||0)*(b.height||0);
+    return (br-ar)||((b.bitrate||0)-(a.bitrate||0));
+  })[0];
 }
 function extract(html, requestedUrl, oembed){
   const id=(requestedUrl.match(/\/video\/(\d+)/i)||[])[1]||'';
@@ -95,10 +145,29 @@ function extract(html, requestedUrl, oembed){
       if(item) break;
     }
   }
+  const variants=collectVariants(video||{});
   const variant=pickVariant(video||{});
   const width=num(first(video?.width,variant?.width,item?.video?.width));
   const height=num(first(video?.height,variant?.height,item?.video?.height));
   const play=first(video?.playAddr,video?.play_addr,video?.downloadAddr,video?.download_addr,variant?.url);
+  const sourceRegion=first(
+    item?.region,item?.regionCode,item?.region_code,
+    item?.authorRegion,item?.author_region,item?.countryCode,item?.country_code,
+    video?.region,video?.regionCode,video?.region_code,
+    author?.region,author?.regionCode,author?.region_code,
+    author?.countryCode,author?.country_code
+  );
+  // Only use an explicitly exposed region/country field. Never infer it from
+  // the viewer's location, language, timezone, or CDN hostname.
+  const variantFps=num(first(video?.fps,video?.frameRate,video?.frame_rate,variant?.fps));
+  const normalizedVariants=variants.map(v=>({
+    ...v,
+    displayQuality:variantQuality(v,variantFps)
+  })).filter(v=>v.url||v.width||v.height||v.quality);
+  const bestQuality=normalizedVariants.slice().sort((a,b)=>{
+    const ar=(a.width||0)*(a.height||0), br=(b.width||0)*(b.height||0);
+    return (br-ar)||((b.bitrate||0)-(a.bitrate||0));
+  })[0]||null;
   const result={
     ok:true,
     id:first(item?.id,item?.aweme_id,id),
@@ -115,7 +184,7 @@ function extract(html, requestedUrl, oembed){
       comments:num(first(stats?.commentCount,stats?.comment_count)),
       favorites:num(first(stats?.collectCount,stats?.collect_count,stats?.favoriteCount,stats?.favorite_count)),
       shares:num(first(stats?.shareCount,stats?.share_count)),
-      downloads:num(first(stats?.downloadCount,stats?.download_count))
+      downloads:first(stats?.downloadCount,stats?.download_count)
     },
     width, height,
     original: width&&height ? `${width}x${height}` : '',
@@ -123,54 +192,418 @@ function extract(html, requestedUrl, oembed){
     codec:variant?.codec || '',
     bitrate:num(variant?.bitrate),
     size:num(variant?.size),
-    browserQuality:variant?.quality || '',
-    phoneQuality:variant?.quality || '',
+    browserQuality:bestQuality?.displayQuality || variantQuality(variant,variantFps) || '',
+    phoneQuality:bestQuality?.displayQuality || variantQuality(variant,variantFps) || '',
+    variants:normalizedVariants,
     playUrl:play || variant?.url || '',
     vq:first(video?.VQScore,video?.vq_score,variant?.VQScore,variant?.vq_score),
+    fps:variantFps,
     source:first(item?.source,video?.source),
-    region:first(item?.region, item?.regionCode, item?.region_code),
+    region:sourceRegion,
     shadowban:first(item?.shadowBan,item?.shadow_ban)
   };
   return result;
 }
+function assessPublicRestrictionSignal(d, pageStatus, oembedOk){
+  // TikTok does not publish an official public "shadow ban" flag.
+  // UI uses Yes/No only when a concrete public signal can support it.
+  // "No" means no public-access restriction signal was detected; it is
+  // NOT an official statement about TikTok's recommendation/moderation systems.
+  const explicit=d.shadowban;
+  if(typeof explicit==='boolean'){
+    return {
+      status:explicit?'Yes':'No',
+      basis:'Explicit boolean field found in the public response; not an official TikTok shadow-ban verdict'
+    };
+  }
+  if(typeof explicit==='string'){
+    const e=explicit.trim().toLowerCase();
+    if(['true','yes','shadow_banned','shadow-ban','shadow ban'].includes(e)){
+      return {status:'Yes',basis:'Explicit public response signal; not an official TikTok shadow-ban verdict'};
+    }
+    if(['false','no','not_shadow_banned'].includes(e)){
+      return {status:'No',basis:'Explicit public response signal; not an official TikTok shadow-ban verdict'};
+    }
+  }
+  const hasId=!!d.id;
+  const hasStats=Object.values(d.stats||{}).some(v=>Number(v)>0);
+  const hasPlayback=!!d.playUrl;
+  if(pageStatus===200 && hasId && (hasPlayback || hasStats || oembedOk)){
+    return {
+      status:'No',
+      basis:'Public video page, metadata and/or playback stream are accessible; no public restriction signal detected. This is not an official TikTok shadow-ban verdict'
+    };
+  }
+  return {
+    status:'Inconclusive',
+    basis:'Insufficient public evidence to classify the video as No or Yes'
+  };
+}
+
 async function fetchText(url, headers={}){
   const r=await fetch(url,{redirect:'follow',headers});
   const text=await r.text();
   return {r,text};
 }
-async function probeMedia(url){
-  if(!url) return {};
-  try{
-    const h=await fetch(url,{redirect:'follow',headers:{Range:'bytes=0-2097151','User-Agent':'Mozilla/5.0'}});
-    const sizeH=h.headers.get('content-range')||'';
-    const m=sizeH.match(/\/(\d+)$/);
-    const total=m?Number(m[1]):Number(h.headers.get('content-length')||0);
-    const type=h.headers.get('content-type')||'';
-    return {size:total||0,contentType:type};
-  }catch(_){return {};}
+function u32(b,o){return o+4<=b.length?((b[o]*0x1000000)+(b[o+1]<<16)+(b[o+2]<<8)+b[o+3]):0}
+function ascii(b,o,n){let s='';for(let i=o;i<Math.min(b.length,o+n);i++){const c=b[i];s+=c>=32&&c<=126?String.fromCharCode(c):'\0'}return s}
+function parseMp4Technical(buf){
+  const b=new Uint8Array(buf), out={codec:'',fps:0,width:0,height:0,bitrate:0};
+  const codecs={avc1:'H.264/AVC',avc3:'H.264/AVC',hvc1:'H.265/HEVC',hev1:'H.265/HEVC',av01:'AV1',vp09:'VP9'};
+  function walk(st,en,ctx={}){
+    let p=st;
+    while(p+8<=en){
+      let size=u32(b,p),type=ascii(b,p+4,4),head=8;
+      if(size===1&&p+16<=en){size=Number((BigInt(u32(b,p+8))*4294967296n)+BigInt(u32(b,p+12)));head=16}
+      if(size===0)size=en-p;
+      if(size<8||p+size>en)break;
+      const body=p+head,end=p+size;
+      if(codecs[type]&&!out.codec)out.codec=codecs[type];
+      if(type==='tkhd'&&body+84<=end){const ver=b[body],wo=ver===1?body+88:body+76,ho=ver===1?body+92:body+80;const w=u32(b,wo)/65536,h=u32(b,ho)/65536;if(w>0&&h>0&&w<10000&&h<10000){out.width=Math.round(w);out.height=Math.round(h)}}
+      if(['avc1','avc3','hvc1','hev1','av01','vp09','mp4v'].includes(type)&&body+28<=end){const w=(b[body+24]<<8)|b[body+25],h=(b[body+26]<<8)|b[body+27];if(w&&h){out.width=w;out.height=h}}
+      if(type==='btrt'&&body+12<=end)out.bitrate=out.bitrate||u32(b,body+8)||u32(b,body+4);
+      let nctx={...ctx};
+      if(type==='trak'){const probe=ascii(b,body,Math.min(8192,end-body));if(/hdlr[\s\S]{4,12}vide/.test(probe))nctx.isVideo=true;const md=probe.indexOf('mdhd');if(md>=0){const mdAbs=body+md,mdBody=mdAbs+8,ver=b[mdBody],ts=ver===1?u32(b,mdBody+20):u32(b,mdBody+8);if(ts)nctx.timescale=ts;}}
+      if(type==='hdlr'&&body+12<=end)nctx.isVideo=ascii(b,body+8,4)==='vide';
+      if(type==='mdhd'&&nctx.isVideo){const ver=b[body],ts=ver===1?u32(b,body+20):u32(b,body+8);if(ts)nctx.timescale=ts}
+      if(type==='stts'&&nctx.isVideo&&body+8<=end&&nctx.timescale){const count=u32(b,body+4);let q=body+8,samp=0,ticks=0;for(let i=0;i<count&&q+8<=end;i++,q+=8){const c=u32(b,q),d=u32(b,q+4);samp+=c;ticks+=c*d}if(samp&&ticks){const fps=samp/(ticks/nctx.timescale);if(fps>1&&fps<240)out.fps=out.fps||fps}}
+      const containers=new Set(['moov','trak','mdia','minf','stbl','stsd','edts','dinf','mvex','moof','traf','mfra','meta','udta','ilst','avc1','avc3','hvc1','hev1','av01','vp09','mp4v']);
+      if(containers.has(type)){let child=body;if(type==='meta')child+=4;if(type==='stsd')child+=8;if(['avc1','avc3','hvc1','hev1','av01','vp09','mp4v'].includes(type))child+=78;if(child<end)walk(child,end,nctx)}
+      p+=size;
+    }
+  }
+  walk(0,b.length,{}); return out;
 }
+async function probeMedia(url, rangeStart=0, rangeEnd=null){
+  if(!url)return {};
+  try{
+    const headers={'User-Agent':'Mozilla/5.0','Accept':'video/mp4,video/*;q=0.9,*/*;q=0.8'};
+    if(Number.isFinite(rangeStart) && rangeStart>=0){
+      headers.Range = rangeEnd!==null && Number.isFinite(rangeEnd)
+        ? `bytes=${rangeStart}-${Math.max(rangeStart,rangeEnd)}`
+        : `bytes=${rangeStart}-${rangeStart+1048575}`;
+    }
+    const h=await fetch(url,{redirect:'follow',headers});
+    const cr=h.headers.get('content-range')||'', m=cr.match(/\/(\d+)$/);
+    const total=m?Number(m[1]):Number(h.headers.get('content-length')||0);
+    const ab=await h.arrayBuffer();
+    const technical=parseMp4Technical(ab);
+    return {size:total||0,contentType:h.headers.get('content-type')||'',technical,contentRange:cr,finalUrl:h.url||url};
+  }catch(_){return {}}
+}
+async function probeMediaDeep(url){
+  if(!url)return {};
+  const head=await probeMedia(url,0,1048575);
+  let best={...head};
+  const total=Number(head.size||0)||0;
+  if(total>1048576){
+    const tail=await probeMedia(url,Math.max(0,total-4194304),total-1);
+    for(const k of ['codec','fps','width','height','bitrate']){
+      if(!best.technical?.[k] && tail.technical?.[k]){
+        best.technical=best.technical||{}; best.technical[k]=tail.technical[k];
+      }
+    }
+    best.size=best.size||tail.size||total;
+  }
+  return best;
+}
+function findDeepValue(root, keys){
+  const wanted=new Set(keys.map(String));
+  for(const o of deepObjects(root)){
+    if(!o||typeof o!=='object')continue;
+    for(const k of wanted){
+      if(Object.prototype.hasOwnProperty.call(o,k)){
+        const v=o[k];
+        if(v!==undefined&&v!==null&&v!==''&&v!==0)return v;
+      }
+    }
+  }
+  return '';
+}
+function detectPrivatePage(html, oembed, item, pageStatus){
+  if(item?.id)return false;
+  const t=String(html||'').toLowerCase();
+  const signals=[
+    'this video is private','video is private','this video is unavailable','video unavailable',
+    'this post is private','post is private','only me','private video','content is unavailable',
+    'video has been removed','video was removed','couldn\'t find this video','could not find this video'
+  ];
+  return pageStatus===200 && (signals.some(x=>t.includes(x)) || !Object.keys(oembed||{}).length && /private|unavailable|removed/.test(t));
+}
+
+const RESEARCH_FIELDS='id,create_time,username,region_code,video_description,music_id,like_count,comment_count,share_count,view_count,favorites_count,video_duration,hashtag_names,video_label,video_tag';
+let researchTokenCache={token:'',expiresAt:0};
+async function getResearchAccessToken(){
+  const direct=process.env.TIKTOK_RESEARCH_ACCESS_TOKEN||'';
+  if(direct) return direct;
+  const key=process.env.TIKTOK_CLIENT_KEY||'';
+  const secret=process.env.TIKTOK_CLIENT_SECRET||'';
+  if(!key||!secret) return '';
+  if(researchTokenCache.token && researchTokenCache.expiresAt>Date.now()+60000) return researchTokenCache.token;
+  try{
+    const body=new URLSearchParams({client_key:key,client_secret:secret,grant_type:'client_credentials'});
+    const r=await fetch('https://open.tiktokapis.com/v2/oauth/token/',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});
+    if(!r.ok)return '';
+    const j=await r.json();
+    if(!j?.access_token)return '';
+    researchTokenCache={token:j.access_token,expiresAt:Date.now()+Math.max(60,Number(j.expires_in||7200)-60)*1000};
+    return j.access_token;
+  }catch(_){return ''}
+}
+function ymdUtc(epoch){
+  const d=new Date(Number(epoch||0)*1000);
+  if(!Number.isFinite(d.getTime()))return '';
+  const y=d.getUTCFullYear(),m=String(d.getUTCMonth()+1).padStart(2,'0'),day=String(d.getUTCDate()).padStart(2,'0');
+  return `${y}${m}${day}`;
+}
+async function researchVideoById(id, createTime){
+  const token=await getResearchAccessToken();
+  if(!token||!id)return null;
+  const date=ymdUtc(createTime)||ymdUtc(Date.now()/1000);
+  try{
+    const r=await fetch('https://open.tiktokapis.com/v2/research/video/query/?fields='+encodeURIComponent(RESEARCH_FIELDS),{
+      method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
+      body:JSON.stringify({query:{and:[{operation:'EQ',field_name:'video_id',field_values:[String(id)]}]},max_count:20,start_date:date,end_date:date})
+    });
+    const j=await r.json();
+    if(!r.ok||j?.error?.code)return null;
+    const list=j?.data?.videos||[];
+    return list.find(v=>String(v.id)===String(id))||null;
+  }catch(_){return null}
+}
+
+
+function collectRawMediaUrls(html){
+  const out=[],seen=new Set();
+  const text=String(html||'');
+  const re=/(https?:\\?\/\\?\/(?:[^"'\\\s]|\\.){20,}?)(?=["'\\\s])/gi;
+  let m;
+  while((m=re.exec(text))){
+    let u=String(m[1]).replace(/\\u002F/gi,'/').replace(/\\\//g,'/').replace(/\\u0026/gi,'&');
+    if(!/^https?:\/\//i.test(u))continue;
+    if(!/(tiktokcdn|ibytedtos|muscdn|byteoversea|bytefcdn)/i.test(u))continue;
+    if(!/\.(?:mp4|m3u8)(?:[?#]|$)/i.test(u) && !/[?&](?:mime_type|format|codec_type|video_id|vwidth|vheight)/i.test(u))continue;
+    if(seen.has(u))continue;
+    seen.add(u); out.push(u);
+    if(out.length>=64)break;
+  }
+  return out;
+}
+
+function normalizePublicRegion(value){
+  if(value===undefined||value===null)return '';
+  const s=String(value).trim().toUpperCase().replace(/[._-]+/g,' ').replace(/\s+/g,' ');
+  const map={LK:'LK',LKA:'LK','SRI LANKA':'LK',US:'US',USA:'US','UNITED STATES':'US',
+    CA:'CA',CAN:'CA',CANADA:'CA',GB:'GB',GBR:'GB',UK:'GB','UNITED KINGDOM':'GB',
+    IN:'IN',IND:'IN',INDIA:'IN',SG:'SG',SGP:'SG',SINGAPORE:'SG',MY:'MY',MYS:'MY',
+    MALAYSIA:'MY',ID:'ID',IDN:'ID',INDONESIA:'ID',AU:'AU',AUS:'AU',AUSTRALIA:'AU',
+    NZ:'NZ',NZL:'NZ','NEW ZEALAND':'NZ',DE:'DE',DEU:'DE',GERMANY:'DE',FR:'FR',
+    FRA:'FR',FRANCE:'FR',JP:'JP',JPN:'JP',JAPAN:'JP',KR:'KR',KOR:'KR','SOUTH KOREA':'KR',
+    BR:'BR',BRA:'BR',BRAZIL:'BR',PH:'PH',PHL:'PH',PHILIPPINES:'PH',TH:'TH',THA:'TH',
+    THAILAND:'TH',VN:'VN',VNM:'VN',VIETNAM:'VN',ES:'ES',ESP:'ES',SPAIN:'ES',
+    IT:'IT',ITA:'IT',ITALY:'IT',NL:'NL',NLD:'NL',NETHERLANDS:'NL',AE:'AE',ARE:'AE',
+    'UNITED ARAB EMIRATES':'AE',SA:'SA',SAU:'SA','SAUDI ARABIA':'SA'};
+  return map[s]||(/^[A-Z]{2}$/.test(s)?s:'');
+}
+function extractPublicRegion(root){
+  if(!root)return '';
+  const keys=['region_code','regionCode','authorRegion','author_region','countryCode','country_code',
+    'country','countryRegion','country_region','registeredCountry','registered_country','creatorRegion','creator_region'];
+  for(const o of deepObjects(root)){
+    if(!o||typeof o!=='object')continue;
+    const authorish=!!(o.author||o.authorInfo||o.uniqueId||o.unique_id||o.nickname||o.creator);
+    if(!authorish)continue;
+    for(const k of keys){ if(Object.prototype.hasOwnProperty.call(o,k)){const r=normalizePublicRegion(o[k]);if(r)return r;} }
+    if(Object.prototype.hasOwnProperty.call(o,'region')){const r=normalizePublicRegion(o.region);if(r)return r;}
+  }
+  for(const o of deepObjects(root)){
+    if(!o||typeof o!=='object')continue;
+    for(const k of keys){ if(Object.prototype.hasOwnProperty.call(o,k)){const r=normalizePublicRegion(o[k]);if(r)return r;} }
+  }
+  return '';
+}
+function extractPublicRegionFromPage(html){
+  const roots=parseScripts(html);
+  for(const root of roots){const r=extractPublicRegion(root);if(r)return {value:r,source:'TikTok public page embedded metadata'};}
+  const t=String(html||'');
+  for(const key of ['region_code','regionCode','authorRegion','author_region','countryCode','country_code']){
+    const re=new RegExp("[\\\"']"+key+"[\\\"']\\s*[:=]\\s*[\\\"']([^\\\"']{1,80})[\\\"']","gi");
+    let m; while((m=re.exec(t))){const r=normalizePublicRegion(m[1]);if(r)return {value:r,source:'TikTok public page embedded metadata'};}
+  }
+  return {value:'',source:''};
+}
+
+
+async function publicTikTokUserRegion(username){
+  const clean=String(username||'').replace(/^@/,'').trim();
+  if(!clean)return null;
+  const endpoints=[
+    'https://www.tiktok.com/api/user/detail/?uniqueId='+encodeURIComponent(clean),
+    'https://www.tiktok.com/api/user/detail/?unique_id='+encodeURIComponent(clean),
+    'https://m.tiktok.com/api/user/detail/?uniqueId='+encodeURIComponent(clean)
+  ];
+  for(const endpoint of endpoints){
+    try{
+      const r=await fetch(endpoint,{
+        redirect:'follow',
+        headers:{
+          'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36',
+          'Accept':'application/json,text/plain,*/*',
+          'Accept-Language':'en-US,en;q=0.9',
+          'Referer':'https://www.tiktok.com/@'+encodeURIComponent(clean)
+        }
+      });
+      if(!r.ok)continue;
+      const j=await r.json();
+      const candidates=[
+        j?.userInfo?.user?.region,j?.user?.region,j?.data?.userInfo?.user?.region,
+        j?.userInfo?.user?.regionCode,j?.userInfo?.user?.region_code,
+        j?.user?.regionCode,j?.user?.region_code
+      ];
+      for(const value of candidates){
+        const region=normalizePublicRegion(value);
+        if(region)return {value:region,source:'TikTok public user detail endpoint'};
+      }
+    }catch(_){}
+  }
+  return null;
+}
+
+function findFirstFieldByRegex(html, keys){
+  const t=String(html||'');
+  for(const key of keys){
+    const re=new RegExp("[\\\"']"+key+"[\\\"']\\s*[:=]\\s*[\\\"']([^\\\"']{1,80})[\\\"']","gi");
+    const m=t.match(re); if(m&&m[1])return m[1];
+  }
+  return '';
+}
+
 async function analyze(url){
   const u=cleanUrl(url);
   const oeUrl='https://www.tiktok.com/oembed?url='+encodeURIComponent(u);
   let oembed={};
   try{ const oe=await fetchText(oeUrl,{'User-Agent':'Mozilla/5.0'}); if(oe.r.ok) oembed=JSON.parse(oe.text); }catch(_){}
   const page=await fetchText(u,{'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36','Accept-Language':'en-US,en;q=0.9'});
-  if(!page.r.ok) throw new Error(`TikTok page returned HTTP ${page.r.status}`);
-  const d=extract(page.text,u,oembed);
-  if(d.playUrl){
-    const p=await probeMedia(d.playUrl);
-    if(!d.size && p.size) d.size=p.size;
-    d.mediaContentType=p.contentType||'';
+  if(!page.r.ok){
+    if([401,403,404].includes(page.r.status)) return {ok:true,private:true,visibility:'Private / Unavailable',id:'',stats:{},region:'',shadowban:'Inconclusive',publicPageStatus:page.r.status};
+    throw new Error(`TikTok page returned HTTP ${page.r.status}`);
   }
-  d.source = d.source || '';
-  d.region = d.region || '';
-  d.shadowban = d.shadowban ?? '';
+  const d=extract(page.text,u,oembed);
+  d.visibility=detectPrivatePage(page.text,oembed, d.id?{id:d.id}:null, page.r.status)?'Private':'Public';
+  if(d.visibility==='Private' && !d.id){
+    return {ok:true,private:true,visibility:'Private',id:'',stats:d.stats||{},region:'',shadowban:'Inconclusive',publicPageStatus:page.r.status};
+  }
+  // Probe the selected stream and every distinct exposed variant. This keeps
+  // FPS/codec/bitrate/size tied to the actual stream instead of one global value.
+  const variantList=Array.isArray(d.variants)?d.variants:[];
+  const rawUrls=collectRawMediaUrls(page.text);
+  const existing=new Set(variantList.map(v=>String(v.url||'')));
+  for(const u0 of rawUrls){
+    if(existing.has(u0))continue;
+    existing.add(u0);
+    variantList.push({name:'discovered_stream',quality:'',codec:'',bitrate:0,size:0,width:0,height:0,fps:0,url:u0,sourceKey:'raw_bootstrap'});
+  }
+  const targets=[...variantList].filter(v=>v.url).slice(0,64);
+  const probed=await Promise.all(targets.map(async v=>({v,p:await probeMediaDeep(v.url)})));
+  for(const {v,p} of probed){
+    const t=p.technical||{};
+    v.size=Number(v.size||p.size||0)||0;
+    v.codec=v.codec||t.codec||'';
+    v.width=Number(v.width||t.width||0)||0;
+    v.height=Number(v.height||t.height||0)||0;
+    v.fps=Number(v.fps||t.fps||0)||0;
+    v.bitrate=Number(v.bitrate||t.bitrate||0)||0;
+    if(!v.bitrate && v.size && d.duration>0)v.bitrate=Math.round((v.size*8)/d.duration);
+    v.displayQuality=variantQuality(v,v.fps);
+  }
+  d.variants=variantList;
+  const best=(d.variants||[]).slice().sort((a,b)=>{
+    const ar=(a.width||0)*(a.height||0), br=(b.width||0)*(b.height||0);
+    const af=a.fps?1:0,bf=b.fps?1:0;
+    return (br-ar)||((bf-af))||((b.bitrate||0)-(a.bitrate||0));
+  })[0]||null;
+  const bestUrl=best?.url||d.playUrl||'';
+  const selected=best||{};
+  d.playUrl=bestUrl;
+  d.width=Number(selected.width||d.width||0)||0;
+  d.height=Number(selected.height||d.height||0)||0;
+  d.original=d.width&&d.height?`${d.width}x${d.height}`:'';
+  d.aspect=d.width&&d.height?(d.width/d.height).toFixed(3):'';
+  d.codec=selected.codec||d.codec||'';
+  d.bitrate=Number(selected.bitrate||d.bitrate||0)||0;
+  d.size=Number(selected.size||d.size||0)||0;
+  d.fps=Number(selected.fps||d.fps||0)||0;
+  d.browserQuality=selected.displayQuality||variantQuality(selected,d.fps)||d.browserQuality||'';
+  d.phoneQuality=d.browserQuality;
+  d.source=d.source||'';
+  // Public-only Region extraction. Never infer Region from viewer/server location,
+  // language, timezone, IP, CDN hostname, or media URL.
+  d.region=d.region||'';
+  d.regionSource=d.regionSource||'';
+  if(d.region){
+    const normalized=normalizePublicRegion(d.region);
+    if(normalized)d.region=normalized;
+  }
+  if(!d.region){
+    const publicRegion=extractPublicRegionFromPage(page.text);
+    if(publicRegion.value){d.region=publicRegion.value;d.regionSource=publicRegion.source;}
+  }
+  // Additional public user-profile fallback inspired by current/open TikTok
+  // web API wrappers: query the public user detail endpoint using the creator
+  // username. Only an explicitly returned region field is accepted.
+  if(!d.region && d.author){
+    const publicUserRegion=await publicTikTokUserRegion(d.author);
+    if(publicUserRegion){
+      d.region=publicUserRegion.value;
+      d.regionSource=publicUserRegion.source;
+    }
+  }
+  // Research API enrichment is optional. It is the documented source for
+  // creator account region_code and additional public content fields. It is
+  // archived research data, not a realtime moderation/analytics feed.
+  const research=await researchVideoById(d.id,d.createTime);
+  if(research){
+    d.researchApi=true;
+    d.region=d.region||research.region_code||'';
+    if(d.stats.views==null || d.stats.views==='') d.stats.views=research.view_count;
+    if(d.stats.likes==null || d.stats.likes==='') d.stats.likes=research.like_count;
+    if(d.stats.comments==null || d.stats.comments==='') d.stats.comments=research.comment_count;
+    if(d.stats.shares==null || d.stats.shares==='') d.stats.shares=research.share_count;
+    if(d.stats.favorites==null || d.stats.favorites==='') d.stats.favorites=research.favorites_count;
+    d.researchRegionBasis='TikTok Research API region_code (creator account registration country; archived research data)';
+  }
+  // Raw bootstrap fallback for fields that exist in the page but are nested
+  // outside the selected item object.
+  if(!d.region){
+    const publicRegion=extractPublicRegionFromPage(page.text);
+    if(publicRegion.value){d.region=publicRegion.value;d.regionSource=publicRegion.source;}
+  }
+  if(!d.source){
+    d.source=findFirstFieldByRegex(page.text,['videoSource','video_source','uploadSource','upload_source','creationSource','creation_source','source']);
+  }
+
+  // Downloads are only reported when TikTok exposes a real download-count field.
+  // Do not estimate or derive it from views/shares.
+  if(!d.stats.downloads){
+    const roots=parseScripts(page.text);
+    for(const root of roots){
+      const x=findDeepValue(root,['downloadCount','download_count','downloads']);
+      if(x!==''&&Number.isFinite(Number(x))){d.stats.downloads=Number(x);break;}
+    }
+  }
+  if(d.stats.downloads!==undefined && d.stats.downloads!==null && d.stats.downloads!=='') d.stats.downloads=Number(d.stats.downloads)||0;
+  const shadowSignal=assessPublicRestrictionSignal(d,page.r.status,!!Object.keys(oembed).length);
+  d.shadowban=shadowSignal.status;
+  d.shadowbanBasis=shadowSignal.basis;
+  d.shadowbanOfficial=false;
+  d.publicPageStatus=page.r.status;
+  d.visibility='Public';
   return d;
 }
 const server=http.createServer(async(req,res)=>{
   if(req.method==='OPTIONS') return send(res,204,'');
   try{
-    if(req.url==='/health') return send(res,200,{ok:true,service:'cazper-analyzer'});
+    if(req.url==='/health') return send(res,200,{ok:true,service:'cazper-analyzer',researchApiConfigured:!!(process.env.TIKTOK_RESEARCH_ACCESS_TOKEN||(process.env.TIKTOK_CLIENT_KEY&&process.env.TIKTOK_CLIENT_SECRET))});
     if(req.method==='POST' && req.url==='/api/analyze'){
       let body=''; for await(const c of req) body+=c;
       const data=JSON.parse(body||'{}');
