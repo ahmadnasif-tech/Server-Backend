@@ -59,7 +59,14 @@ function rawNumberCandidates(html, keys){
   const t=String(html||''), out=[];
   for(const key of keys){
     const re=new RegExp('["\\\\]'+key+'["\\\\]\\s*[:=]\\s*["\\\\]?(\\d{1,4})','gi');
-    let m; while((m=re.exec(t))) { const n=Number(m[1]); if(Number.isFinite(n)&&n>0&&n<=240) out.push(n); }
+    let m;
+    while((m=re.exec(t))){
+      const n=Number(m[1]);
+      if(!Number.isFinite(n)||n<=0||n>240)continue;
+      const context=t.slice(Math.max(0,m.index-2500),Math.min(t.length,m.index+2500));
+      if(!/(bit_rate|bitrateInfo|bitrate_info|play_addr|playAddr|video)/i.test(context))continue;
+      out.push(n);
+    }
   }
   return out;
 }
@@ -68,10 +75,24 @@ function modeNumber(values){
   return [...c.entries()].sort((a,b)=>b[1]-a[1]||a[0]-b[0])[0][0];
 }
 function rawRegionCandidate(html){
+  // IMPORTANT: do not scan the whole page for a generic `region`/`country`
+  // field. TikTok pages can contain viewer/request/market metadata that is
+  // not the creator's account country. Only accept creator-bound keys.
   const t=String(html||'');
-  for(const key of ['region_code','regionCode','authorRegion','author_region','countryCode','country_code','registeredCountry','registered_country','creatorRegion','creator_region']){
-    const re=new RegExp('["\\\\]'+key+'["\\\\]\\s*[:=]\\s*["\\\\]([^"\\\\]{1,80})','i');
-    const m=t.match(re); if(m){const r=normalizePublicRegion(m[1]); if(r)return r;}
+  const keys=['region_code','regionCode','authorRegion','author_region',
+    'registeredCountry','registered_country','creatorRegion','creator_region'];
+  for(const key of keys){
+    const re=new RegExp('["\\\\]'+key+'["\\\\]\\s*[:=]\\s*["\\\\]([^"\\\\]{1,80})','gi');
+    let m;
+    while((m=re.exec(t))){
+      const before=t.slice(Math.max(0,m.index-1800),m.index);
+      const after=t.slice(m.index,m.index+1200);
+      // Require nearby author/profile semantics; this prevents request-region
+      // or unrelated geo fields from becoming the displayed creator Region.
+      if(!/(author|authorInfo|uniqueId|unique_id|nickname|creator|userInfo|profile|user-detail)/i.test(before+after)) continue;
+      const r=normalizePublicRegion(m[1]);
+      if(r)return r;
+    }
   }
   return '';
 }
@@ -113,7 +134,7 @@ function collectVariants(video){
     const size=num(o.DataSize,o.data_size,o.dataSize,p.DataSize,p.data_size,p.DataSize,p.size);
     const fps=num(o.FPS,o.Fps,o.fps,o.FrameRate,o.frameRate,o.frame_rate,p.FPS,p.Fps,p.fps,p.FrameRate,p.frameRate,p.frame_rate);
     const name=String(q||keyHint||'video stream');
-    const id=url+'|'+name+'|'+width+'x'+height+'|'+codec;
+    const id=url+'|'+name+'|'+width+'x'+height+'|'+codec+'|'+fps;
     if(seen.has(id))return;
     seen.add(id);
     out.push({name,quality:String(q||''),codec:String(codec||''),bitrate,size,width,height,fps,url,sourceKey:String(keyHint||'')});
@@ -169,24 +190,46 @@ function extract(html, requestedUrl, oembed){
       if(item) break;
     }
   }
-  const variants=collectVariants(video||{});
-  const variant=pickVariant(video||{});
+  // Scan every parsed bootstrap root that contains this video's object. TikTok
+  // can split `bit_rate`/`bitrateInfo` metadata across more than one script
+  // container; scanning only the first root can silently lose FPS.
+  let variants=collectVariants(video||{});
+  const variantSeen=new Set(variants.map(v=>String(v.url||'')+'|'+String(v.name||v.quality||'')+'|'+String(v.fps||0)));
+  for(const root of roots){
+    const cand=findVideo(root,id);
+    const vv=cand?.video||cand;
+    if(!vv||typeof vv!=='object')continue;
+    for(const v of collectVariants(vv)){
+      const key=String(v.url||'')+'|'+String(v.name||v.quality||'')+'|'+String(v.fps||0);
+      if(!key||variantSeen.has(key))continue;
+      variantSeen.add(key); variants.push(v);
+    }
+  }
+  const variant=variants.slice().sort((a,b)=>{
+    const ar=(a.width||0)*(a.height||0), br=(b.width||0)*(b.height||0);
+    return (br-ar)||((b.bitrate||0)-(a.bitrate||0));
+  })[0]||null;
   const width=num(first(video?.width,variant?.width,item?.video?.width));
   const height=num(first(video?.height,variant?.height,item?.video?.height));
   const play=first(video?.playAddr,video?.play_addr,video?.downloadAddr,video?.download_addr,variant?.url);
+  // Region is creator/account metadata only. Generic item/video `region`
+  // fields are deliberately ignored because they can reflect request/market
+  // context rather than the creator's registered country.
   const sourceRegion=first(
-    item?.region,item?.regionCode,item?.region_code,
-    item?.authorRegion,item?.author_region,item?.countryCode,item?.country_code,
-    video?.region,video?.regionCode,video?.region_code,
-    author?.region,author?.regionCode,author?.region_code,
-    author?.countryCode,author?.country_code
+    item?.authorRegion,item?.author_region,
+    item?.creatorRegion,item?.creator_region,
+    item?.registeredCountry,item?.registered_country,
+    author?.regionCode,author?.region_code,
+    author?.countryCode,author?.country_code,
+    author?.registeredCountry,author?.registered_country,
+    author?.region
   );
   // Only use an explicitly exposed region/country field. Never infer it from
   // the viewer's location, language, timezone, or CDN hostname.
   const variantFps=num(first(video?.fps,video?.frameRate,video?.frame_rate,variant?.fps));
   const normalizedVariants=variants.map(v=>({
     ...v,
-    displayQuality:variantQuality(v,variantFps)
+    displayQuality:variantQuality(v)
   })).filter(v=>v.url||v.width||v.height||v.quality);
   const bestQuality=normalizedVariants.slice().sort((a,b)=>{
     const ar=(a.width||0)*(a.height||0), br=(b.width||0)*(b.height||0);
@@ -225,6 +268,7 @@ function extract(html, requestedUrl, oembed){
     fps:variantFps,
     source:first(item?.source,video?.source),
     region:sourceRegion,
+    regionSource:sourceRegion?'TikTok public creator metadata':'',
     shadowban:first(item?.shadowBan,item?.shadow_ban)
   };
   return result;
@@ -444,56 +488,73 @@ function extractPublicRegion(root){
     for(const k of keys){ if(Object.prototype.hasOwnProperty.call(o,k)){const r=normalizePublicRegion(o[k]);if(r)return r;} }
     if(Object.prototype.hasOwnProperty.call(o,'region')){const r=normalizePublicRegion(o.region);if(r)return r;}
   }
-  for(const o of deepObjects(root)){
-    if(!o||typeof o!=='object')continue;
-    for(const k of keys){ if(Object.prototype.hasOwnProperty.call(o,k)){const r=normalizePublicRegion(o[k]);if(r)return r;} }
-  }
+  // No global fallback: a region value without creator/profile context is
+  // not authoritative enough to display as the creator's country.
   return '';
 }
 function extractPublicRegionFromPage(html){
   const roots=parseScripts(html);
   for(const root of roots){const r=extractPublicRegion(root);if(r)return {value:r,source:'TikTok public page embedded metadata'};}
   const t=String(html||'');
-  for(const key of ['region_code','regionCode','authorRegion','author_region','countryCode','country_code']){
+  for(const key of ['region_code','regionCode','authorRegion','author_region']){
     const re=new RegExp("[\\\"']"+key+"[\\\"']\\s*[:=]\\s*[\\\"']([^\\\"']{1,80})[\\\"']","gi");
     let m; while((m=re.exec(t))){const r=normalizePublicRegion(m[1]);if(r)return {value:r,source:'TikTok public page embedded metadata'};}
   }
   return {value:'',source:''};
 }
 
-function extractUserDetailRegionFromHtml(html){
+function extractUserDetailRegionFromHtml(html, username=''){
   const t=String(html||'');
-  // Current TikTok web pages embed creator profile data under
-  // __DEFAULT_SCOPE__.webapp.user-detail. Some deployments expose `region`
-  // only inside that profile object, not inside the video item.
+  const wanted=String(username||'').replace(/^@/,'').toLowerCase();
   const markers=['webapp.user-detail','user-detail','__DEFAULT_SCOPE__'];
   for(const marker of markers){
     let pos=0;
     while((pos=t.indexOf(marker,pos))>=0){
-      const chunk=t.slice(Math.max(0,pos-2000),Math.min(t.length,pos+120000));
+      const chunk=t.slice(Math.max(0,pos-4000),Math.min(t.length,pos+140000));
+      // If a username is available, prefer a chunk that actually contains the
+      // same creator handle. This prevents another embedded profile/geo object
+      // from being mistaken for the video's author.
+      if(wanted && !new RegExp('(?:uniqueId|unique_id|unique_id_str|nickname)[^]{0,120}'+wanted.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'i').test(chunk)){
+        pos+=marker.length;
+        continue;
+      }
       const patterns=[
-        /\"region\"\s*:\s*\"([^\"]{1,80})\"/i,
-        /\"region_code\"\s*:\s*\"([^\"]{1,80})\"/i,
-        /\"regionCode\"\s*:\s*\"([^\"]{1,80})\"/i
+        /"region_code"\s*:\s*"([^"]{1,80})"/i,
+        /"regionCode"\s*:\s*"([^"]{1,80})"/i,
+        /"registeredCountry"\s*:\s*"([^"]{1,80})"/i,
+        /"registered_country"\s*:\s*"([^"]{1,80})"/i,
+        /"creatorRegion"\s*:\s*"([^"]{1,80})"/i,
+        /"creator_region"\s*:\s*"([^"]{1,80})"/i,
+        /"region"\s*:\s*"([^"]{1,80})"/i
       ];
-      for(const re of patterns){const m=chunk.match(re);if(m){const r=normalizePublicRegion(m[1]);if(r)return {value:r,source:'TikTok webapp.user-detail creator profile'};}}
+      for(const re of patterns){
+        const m=chunk.match(re);
+        if(m){
+          const r=normalizePublicRegion(m[1]);
+          if(r)return {value:r,source:'TikTok webapp.user-detail creator profile'};
+        }
+      }
       pos+=marker.length;
     }
   }
   return {value:'',source:''};
 }
 
-
 async function publicTikTokUserRegion(username){
   const clean=String(username||'').replace(/^@/,'').trim();
   if(!clean)return null;
+  const escaped=clean.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
   const endpoints=[
     'https://www.tiktok.com/api/user/detail/?uniqueId='+encodeURIComponent(clean),
     'https://www.tiktok.com/api/user/detail/?unique_id='+encodeURIComponent(clean),
-    'https://m.tiktok.com/api/user/detail/?uniqueId='+encodeURIComponent(clean),
-    'https://www.tiktok.com/api/user/detail/?unique_id='+encodeURIComponent(clean)
+    'https://m.tiktok.com/api/user/detail/?uniqueId='+encodeURIComponent(clean)
   ];
-  const regionKeys=['region','regionCode','region_code','countryCode','country_code','registeredCountry','registered_country'];
+  const regionKeys=['regionCode','region_code','countryCode','country_code','registeredCountry','registered_country','creatorRegion','creator_region','region'];
+  const isSameUser=(o)=>{
+    if(!o||typeof o!=='object')return false;
+    const ids=[o.uniqueId,o.unique_id,o.unique_id_str,o.username,o.handle,o.nickname].filter(Boolean).map(v=>String(v).replace(/^@/,'').toLowerCase());
+    return ids.includes(clean.toLowerCase());
+  };
   for(const endpoint of endpoints){
     try{
       const r=await fetch(endpoint,{
@@ -507,32 +568,65 @@ async function publicTikTokUserRegion(username){
       });
       if(!r.ok)continue;
       const j=await r.json();
-      const direct=[
-        j?.userInfo?.user?.region,j?.user?.region,j?.data?.userInfo?.user?.region,
-        j?.userInfo?.user?.regionCode,j?.userInfo?.user?.region_code,
-        j?.user?.regionCode,j?.user?.region_code,
-        j?.userInfo?.user?.countryCode,j?.userInfo?.user?.country_code
-      ];
-      for(const value of direct){
-        const region=normalizePublicRegion(value);
-        if(region)return {value:region,source:'TikTok public user detail endpoint'};
-      }
-      // Some public responses wrap the profile several levels deeper. Accept
-      // only explicit region/country-code fields on an object that also looks
-      // like a user/profile record; never use generic geo/location fields.
       for(const o of deepObjects(j)){
-        if(!o||typeof o!=='object')continue;
-        const userish=!!(o.uniqueId||o.unique_id||o.nickname||o.secUid||o.sec_uid||o.user||o.userInfo||o.profile);
-        if(!userish)continue;
+        if(!isSameUser(o))continue;
         for(const k of regionKeys){
           if(Object.prototype.hasOwnProperty.call(o,k)){
             const region=normalizePublicRegion(o[k]);
-            if(region)return {value:region,source:'TikTok public user detail endpoint'};
+            if(region)return {value:region,source:'TikTok public creator profile'};
+          }
+        }
+        // Nested user/profile object can carry the explicit region.
+        for(const childKey of ['user','profile','userInfo']){
+          const child=o[childKey];
+          if(child&&typeof child==='object'&&isSameUser(child)){
+            for(const k of regionKeys){
+              const region=normalizePublicRegion(child[k]);
+              if(region)return {value:region,source:'TikTok public creator profile'};
+            }
           }
         }
       }
     }catch(_){}
   }
+
+  // Direct public profile page fallback. This is live/public metadata and does
+  // not use viewer IP, Render region, CDN region, or any hardcoded country.
+  try{
+    const profileUrl='https://www.tiktok.com/@'+encodeURIComponent(clean);
+    const r=await fetch(profileUrl,{
+      redirect:'follow',
+      headers:{
+        'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36',
+        'Accept':'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
+        'Accept-Language':'en-US,en;q=0.9',
+        'Referer':'https://www.tiktok.com/'
+      }
+    });
+    if(r.ok){
+      const html=await r.text();
+      const fromProfile=extractUserDetailRegionFromHtml(html,clean);
+      if(fromProfile.value)return fromProfile;
+      const roots=parseScripts(html);
+      for(const root of roots){
+        for(const o of deepObjects(root)){
+          if(!isSameUser(o))continue;
+          for(const k of regionKeys){
+            const region=normalizePublicRegion(o[k]);
+            if(region)return {value:region,source:'TikTok public creator profile'};
+          }
+        }
+      }
+      // Last strict raw fallback: region key must be close to this creator
+      // handle/profile marker.
+      const re=new RegExp('(?:uniqueId|unique_id|nickname|username)[^]{0,2500}'+escaped+'[^]{0,2500}"(?:region_code|regionCode|registeredCountry|registered_country|creatorRegion|creator_region|region)"\\\\s*:\\\\s*"([^"]{1,80})"','i');
+      const m=html.match(re);
+      if(m){
+        const region=normalizePublicRegion(m[1]);
+        if(region)return {value:region,source:'TikTok public creator profile'};
+      }
+    }
+  }catch(_){}
   return null;
 }
 
@@ -560,7 +654,7 @@ async function fetchUnsignedItemDetail(id, pageHtml){
     channel:'tiktok_web',cookie_enabled:'true',device_platform:'web_pc',
     focus_state:'true',from_page:'video',history_len:'1',is_fullscreen:'false',
     is_page_visible:'true',itemId:String(id),language:'en',os:'windows',
-    priority_region:'US',referer:'',region:'US',screen_height:'1080',
+    priority_region:'',referer:'',region:'',screen_height:'1080',
     screen_width:'1920',webcast_language:'en',tz_name:'UTC'
   });
   if(msToken) params.set('msToken',msToken);
@@ -577,6 +671,43 @@ async function fetchUnsignedItemDetail(id, pageHtml){
     if(!text||!text.trim())return null;
     try{return JSON.parse(text)}catch(_){return null}
   }catch(_){return null}
+}
+
+async function fetchTikTokMobileVariants(url, id){
+  if(!url||!id)return {variants:[],fps:0,region:'',regionSource:''};
+  const uas=[
+    'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 Version/18.6 Mobile/15E148 Safari/604.1'
+  ];
+  let best={variants:[],fps:0,region:'',regionSource:''};
+  for(const ua of uas){
+    try{
+      const page=await fetchText(url,{
+        'User-Agent':ua,
+        'Accept':'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
+        'Accept-Language':'en-US,en;q=0.9',
+        'Referer':'https://www.tiktok.com/'
+      });
+      if(!page.r.ok)continue;
+      const roots=parseScripts(page.text);
+      let found=[];
+      for(const root of roots){
+        const cand=findVideo(root,id);
+        const vv=cand?.video||cand;
+        if(!vv||typeof vv!=='object')continue;
+        found.push(...collectVariants(vv));
+      }
+      const seen=new Set();
+      found=found.filter(v=>{
+        const k=String(v.url||'')+'|'+String(v.name||v.quality||'')+'|'+String(v.fps||0);
+        if(!k||seen.has(k))return false; seen.add(k); return true;
+      });
+      const fps=modeNumber(found.map(v=>Number(v.fps||0)).filter(n=>n>0));
+      if(found.length>best.variants.length || fps>best.fps)best={variants:found,fps,region:'',regionSource:''};
+      if(found.some(v=>v.fps>0))break;
+    }catch(_){}
+  }
+  return best;
 }
 
 async function analyze(url){
@@ -609,12 +740,32 @@ async function analyze(url){
       }
     }
   }catch(_){}
+  // Mobile-web enrichment: current TikTok extractors also use the mobile
+  // webpage, where `video.bit_rate[].FPS` is often present even when the
+  // desktop bootstrap omits it. This is still public TikTok metadata.
+  try{
+    if(!d.fps || !(d.variants||[]).some(v=>Number(v.fps||0)>0)){
+      const mobile=await fetchTikTokMobileVariants(u,d.id||((u.match(/\/video\/(\d+)/i)||[])[1]||''));
+      if(mobile.variants.length){
+        d.variants=[...(d.variants||[]),...mobile.variants];
+        const seen=new Set();
+        d.variants=d.variants.filter(v=>{
+          const k=String(v.url||'')+'|'+String(v.name||v.quality||'')+'|'+String(v.fps||0);
+          if(!k||seen.has(k))return false; seen.add(k); return true;
+        });
+      }
+      if(!d.fps && mobile.fps)d.fps=mobile.fps;
+    }
+  }catch(_){}
   // Raw bootstrap fallback: catches escaped/non-standard TikTok JSON containers.
+  // Raw HTML FPS fallback is used only for the overall video field. Never copy
+  // one global FPS value onto every stream; different TikTok variants can have
+  // different frame rates.
   const rawFps=rawNumberCandidates(page.text,['FPS','Fps','fps','FrameRate','frameRate','frame_rate']);
   const rawFpsMode=modeNumber(rawFps);
   if(!d.fps && rawFpsMode) d.fps=rawFpsMode;
-  if(Array.isArray(d.variants) && rawFpsMode){
-    for(const v of d.variants){ if(!v.fps) v.fps=rawFpsMode; v.displayQuality=variantQuality(v,rawFpsMode); }
+  if(Array.isArray(d.variants)){
+    for(const v of d.variants) v.displayQuality=variantQuality(v);
   }
   if(!d.region){ const rr=rawRegionCandidate(page.text); if(rr) d.region=rr; }
   d.visibility=detectPrivatePage(page.text,oembed, d.id?{id:d.id}:null, page.r.status)?'Private':'Public';
@@ -673,7 +824,7 @@ async function analyze(url){
     if(normalized)d.region=normalized;
   }
   if(!d.region){
-    const exact=extractUserDetailRegionFromHtml(page.text);
+    const exact=extractUserDetailRegionFromHtml(page.text,d.username);
     if(exact.value){d.region=exact.value;d.regionSource=exact.source;}
   }
   if(!d.region){
@@ -694,7 +845,7 @@ async function analyze(url){
         'Referer':u
       });
       if(pr.r.ok){
-        const exact=extractUserDetailRegionFromHtml(pr.text);
+        const exact=extractUserDetailRegionFromHtml(pr.text,d.username);
         if(exact.value){d.region=exact.value;d.regionSource=exact.source;}
         if(!d.region){
           const rr=extractPublicRegionFromPage(pr.text);
@@ -716,7 +867,8 @@ async function analyze(url){
   const research=await researchVideoById(d.id,d.createTime);
   if(research){
     d.researchApi=true;
-    d.region=d.region||research.region_code||'';
+    if(!d.region && research.region_code){d.region=normalizePublicRegion(research.region_code)||String(research.region_code);d.regionSource='TikTok Research API region_code (creator account registration country)';}
+
     if(d.stats.views==null || d.stats.views==='') d.stats.views=research.view_count;
     if(d.stats.likes==null || d.stats.likes==='') d.stats.likes=research.like_count;
     if(d.stats.comments==null || d.stats.comments==='') d.stats.comments=research.comment_count;
