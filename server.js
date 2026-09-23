@@ -461,6 +461,28 @@ function extractPublicRegionFromPage(html){
   return {value:'',source:''};
 }
 
+function extractUserDetailRegionFromHtml(html){
+  const t=String(html||'');
+  // Current TikTok web pages embed creator profile data under
+  // __DEFAULT_SCOPE__.webapp.user-detail. Some deployments expose `region`
+  // only inside that profile object, not inside the video item.
+  const markers=['webapp.user-detail','user-detail','__DEFAULT_SCOPE__'];
+  for(const marker of markers){
+    let pos=0;
+    while((pos=t.indexOf(marker,pos))>=0){
+      const chunk=t.slice(Math.max(0,pos-2000),Math.min(t.length,pos+120000));
+      const patterns=[
+        /\"region\"\s*:\s*\"([^\"]{1,80})\"/i,
+        /\"region_code\"\s*:\s*\"([^\"]{1,80})\"/i,
+        /\"regionCode\"\s*:\s*\"([^\"]{1,80})\"/i
+      ];
+      for(const re of patterns){const m=chunk.match(re);if(m){const r=normalizePublicRegion(m[1]);if(r)return {value:r,source:'TikTok webapp.user-detail creator profile'};}}
+      pos+=marker.length;
+    }
+  }
+  return {value:'',source:''};
+}
+
 
 async function publicTikTokUserRegion(username){
   const clean=String(username||'').replace(/^@/,'').trim();
@@ -523,43 +545,6 @@ function findFirstFieldByRegex(html, keys){
   return '';
 }
 
-async function fetchTikTokAppDetail(id){
-  if(!id)return null;
-  const deviceId=String(7250000000000000000n + BigInt(Math.floor(Math.random()*7509949999994577)));
-  const iid=String(7370000000000000000n + BigInt(Math.floor(Math.random()*999999999999999)));
-  const appVersion='35.1.3', manifest='2023501030';
-  const params=new URLSearchParams({
-    share_link_mode:'0', share_scene:'0', iid, device_id:deviceId,
-    ac:'wifi', channel:'googleplay', aid:'1233', app_name:'musical_ly',
-    version_code:'350103', version_name:appVersion, device_platform:'android',
-    os:'android', ab_version:appVersion, ssmix:'a', device_type:'Pixel 7',
-    device_brand:'Google', language:'en', os_api:'29', os_version:'13',
-    openudid:'', manifest_version_code:manifest, resolution:'1080*2400',
-    dpi:'420', current_region:'US', app_type:'normal', sys_region:'US',
-    app_language:'en', timezone_name:'America/New_York', residence:'US',
-    carrier_region:'US', op_region:'US', build_number:appVersion,
-    region:'US', ts:String(Math.floor(Date.now()/1000)),
-    device_platform:'android'
-  });
-  try{
-    const r=await fetch('https://api16-normal-c-useast1a.tiktokv.com/aweme/v1/multi/aweme/detail/?'+params.toString(),{
-      method:'POST', redirect:'follow',
-      headers:{
-        'User-Agent':'com.zhiliaoapp.musically/2023501030 (Linux; U; Android 13; en_US; Pixel 7; Build/TD1A.220804.031; Cronet/58.0.2991.0)',
-        'Accept':'application/json',
-        'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'
-      },
-      body:new URLSearchParams({aweme_ids:JSON.stringify([String(id)]),request_source:'0'}).toString()
-    });
-    const text=await r.text();
-    if(!r.ok||!text)return null;
-    try{
-      const j=JSON.parse(text);
-      return j?.aweme_details?.[0] || j?.aweme_detail || null;
-    }catch(_){return null}
-  }catch(_){return null}
-}
-
 async function fetchUnsignedItemDetail(id, pageHtml){
   if(!id) return null;
   // TikTok's web item-detail endpoint is known to return the same aweme_detail
@@ -594,88 +579,6 @@ async function fetchUnsignedItemDetail(id, pageHtml){
   }catch(_){return null}
 }
 
-
-function readU32(b,o){ return o+4<=b.length ? b.readUInt32BE(o) : 0; }
-function readU64(b,o){ return o+8<=b.length ? Number(b.readBigUInt64BE(o)) : 0; }
-function parseMp4Fps(buf){
-  try{
-    const b=Buffer.isBuffer(buf)?buf:Buffer.from(buf);
-    const findVideoTrak=(start,end)=>{
-      let p=start;
-      while(p+8<=end){
-        let size=readU32(b,p), type=b.toString('ascii',p+4,p+8), head=8;
-        if(size===1){ size=readU64(b,p+8); head=16; }
-        if(!size || p+size>end) break;
-        if(type==='trak'){
-          const hdlr=findBox(p+head,p+size,['mdia','hdlr']);
-          if(hdlr && b.toString('ascii',hdlr+8+8,hdlr+8+12)==='vide') return p+head;
-        }
-        p+=size;
-      }
-      return -1;
-    };
-    const findBox=(start,end,path)=>{
-      if(!path.length)return start;
-      let p=start;
-      while(p+8<=end){
-        let size=readU32(b,p), type=b.toString('ascii',p+4,p+8), head=8;
-        if(size===1){size=readU64(b,p+8);head=16;}
-        if(!size||p+size>end)break;
-        if(type===path[0]){
-          if(path.length===1)return p;
-          const r=findBox(p+head,p+size,path.slice(1)); if(r>=0)return r;
-        }
-        p+=size;
-      }
-      return -1;
-    };
-    const moov=findBox(0,b.length,['moov']);
-    if(moov<0)return 0;
-    const moovHead=(readU32(b,moov)===1?16:8);
-    const moovEnd=moov+readU32(b,moov);
-    let p=moov+moovHead;
-    while(p+8<=moovEnd){
-      let size=readU32(b,p), type=b.toString('ascii',p+4,p+8), head=8;
-      if(size===1){size=readU64(b,p+8);head=16;}
-      if(!size||p+size>moovEnd)break;
-      if(type==='trak'){
-        const hdlr=findBox(p+head,p+size,['mdia','hdlr']);
-        const isVideo=hdlr>=0 && b.toString('ascii',hdlr+16,hdlr+20)==='vide';
-        if(isVideo){
-          const mdhd=findBox(p+head,p+size,['mdia','mdhd']);
-          const stts=findBox(p+head,p+size,['mdia','minf','stbl','stts']);
-          if(mdhd>=0&&stts>=0){
-            const version=b[mdhd+8];
-            const tsOffset=version===1?8+16:8+8;
-            const timescale=readU32(b,mdhd+tsOffset);
-            const n=readU32(b,stts+12);
-            let q=stts+16, samples=0, duration=0;
-            for(let i=0;i<n && q+8<=b.length;i++,q+=8){
-              const count=readU32(b,q), delta=readU32(b,q+4);
-              samples+=count; duration+=count*delta;
-            }
-            if(timescale>0&&duration>0&&samples>0){
-              const fps=samples/(duration/timescale);
-              if(Number.isFinite(fps)&&fps>1&&fps<240)return Math.round(fps*100)/100;
-            }
-          }
-        }
-      }
-      p+=size;
-    }
-  }catch(_){ }
-  return 0;
-}
-async function probeVideoFps(url){
-  if(!url)return 0;
-  try{
-    const r=await fetch(url,{redirect:'follow',headers:{Range:'bytes=0-16777215','User-Agent':'Mozilla/5.0'}});
-    if(!r.ok)return 0;
-    const ab=await r.arrayBuffer();
-    return parseMp4Fps(Buffer.from(ab));
-  }catch(_){return 0;}
-}
-
 async function analyze(url){
   const u=cleanUrl(url);
   const oeUrl='https://www.tiktok.com/oembed?url='+encodeURIComponent(u);
@@ -687,41 +590,6 @@ async function analyze(url){
     throw new Error(`TikTok page returned HTTP ${page.r.status}`);
   }
   const d=extract(page.text,u,oembed);
-  // Last-resort technical FPS probe: derive the video track frame rate from MP4
-  // timing metadata when TikTok JSON does not expose FPS. This is independent of
-  // TikTok metadata and therefore works for ordinary public MP4 playback URLs.
-  try{
-    if(!d.fps && d.playUrl){
-      const mediaFps=await probeVideoFps(d.playUrl);
-      if(mediaFps){ d.fps=mediaFps; d.fpsSource='MP4 video track timing metadata'; }
-    }
-  }catch(_){}
-  // App-detail enrichment: TikTok's current mobile endpoint exposes video.bit_rate[]
-  // entries with an explicit FPS field. This is the same public app-data path
-  // used by current TikTok extractors; it is used only as a best-effort source.
-  try{
-    const appDetail=await fetchTikTokAppDetail(d.id||((u.match(/\/video\/(\d+)/i)||[])[1]||''));
-    const appVideo=appDetail?.video;
-    if(appVideo){
-      const appVariants=collectVariants(appVideo);
-      if(appVariants.length){
-        d.variants=[...(d.variants||[]),...appVariants];
-        const seen=new Set();
-        d.variants=d.variants.filter(v=>{const k=String(v.url||'')+'|'+String(v.name||'')+'|'+String(v.fps||0);if(seen.has(k))return false;seen.add(k);return true;});
-        const appFps=modeNumber(appVariants.map(v=>Number(v.fps||0)).filter(n=>n>0));
-        if(appFps){d.fps=appFps;d.fpsSource='TikTok mobile aweme detail video.bit_rate[].FPS';}
-      }
-      const appRegion=first(
-        appDetail?.author?.region, appDetail?.author?.regionCode, appDetail?.author?.region_code,
-        appDetail?.author?.countryCode, appDetail?.author?.country_code,
-        appDetail?.region, appDetail?.regionCode, appDetail?.region_code,
-        appDetail?.countryCode, appDetail?.country_code
-      );
-      const normalized=normalizePublicRegion(appRegion);
-      if(normalized && !d.region){d.region=normalized;d.regionSource='TikTok mobile aweme detail explicit creator region';}
-    }
-  }catch(_){}
-
   // API-style enrichment: current TikTok extractors obtain per-stream FPS
   // from video.bit_rate[]. The normal web page exposes bitrateInfo instead,
   // so try the public web item-detail response as an additional source.
@@ -805,6 +673,10 @@ async function analyze(url){
     if(normalized)d.region=normalized;
   }
   if(!d.region){
+    const exact=extractUserDetailRegionFromHtml(page.text);
+    if(exact.value){d.region=exact.value;d.regionSource=exact.source;}
+  }
+  if(!d.region){
     const publicRegion=extractPublicRegionFromPage(page.text);
     if(publicRegion.value){d.region=publicRegion.value;d.regionSource=publicRegion.source;}
   }
@@ -822,8 +694,12 @@ async function analyze(url){
         'Referer':u
       });
       if(pr.r.ok){
-        const rr=extractPublicRegionFromPage(pr.text);
-        if(rr.value){d.region=rr.value;d.regionSource='TikTok public creator profile embedded metadata';}
+        const exact=extractUserDetailRegionFromHtml(pr.text);
+        if(exact.value){d.region=exact.value;d.regionSource=exact.source;}
+        if(!d.region){
+          const rr=extractPublicRegionFromPage(pr.text);
+          if(rr.value){d.region=rr.value;d.regionSource='TikTok public creator profile embedded metadata';}
+        }
       }
     }catch(_){}
   }
